@@ -14,6 +14,7 @@
 - **Windows 10 / 11**：运行 [`dist/拾分-Windows-安装程序-v1.1.exe`](dist/拾分-Windows-安装程序-v1.1.exe)，按向导安装；默认装到当前用户，无需管理员权限，会创建桌面和开始菜单快捷方式。
 - **Android 7.0+**：安装 [`dist/拾分-Android-v1.1.apk`](dist/拾分-Android-v1.1.apk)。这是使用系统 WebView 的离线应用；首次安装需允许“未知来源应用”。学习数据在应用私有目录，卸载会删除，建议先导出备份。
 - 两个安装包和说明也打在一起：[`dist/拾分-双端安装包-v1.1.zip`](dist/拾分-双端安装包-v1.1.zip)、[`dist/安装说明.txt`](dist/安装说明.txt)。
+- GitHub 发布页：[`v1.1 Release`](https://github.com/ks-jiang502/shifen-quiz/releases/tag/v1.1)。
 
 > Windows 版依赖 Microsoft Edge WebView2 运行时（Windows 11 通常自带；Windows 10 若缺少会提示下载）。安装包未做商业代码签名，SmartScreen 提示时选择「更多信息 → 仍要运行」。
 
