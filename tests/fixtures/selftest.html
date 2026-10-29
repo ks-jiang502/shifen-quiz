@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>拾分 E2E harness selftest</title>
+</head>
+<body>
+<h1 id="title">harness selftest</h1>
+<button id="btn" type="button">click</button>
+<div id="out">0</div>
+<input id="file" type="file">
+<div id="fileInfo">none</div>
+<script>
+  document.getElementById('btn').addEventListener('click', function () {
+    var out = document.getElementById('out');
+    out.textContent = String(Number(out.textContent) + 1);
+  });
+  document.getElementById('file').addEventListener('change', function (e) {
+    var files = e.target.files;
+    document.getElementById('fileInfo').textContent = files && files.length ? files[0].name : 'none';
+  });
+</script>
+</body>
+</html>

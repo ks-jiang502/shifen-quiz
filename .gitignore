@@ -1,0 +1,26 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# Local tooling / credentials
+.tools/
+.gh-config/
+.pylibs/
+__pycache__/
+*.py[cod]
+*.log
+
+# Local build output
+build/
+dist/*.log
+*.tmp
+*.bak
+
+# Duplicated all-in-one download archive (dist/ is committed instead)
+拾分-离线简答刷题-v1.1.zip
+
+# Test artifacts that contain machine-specific paths
+tests/*.log

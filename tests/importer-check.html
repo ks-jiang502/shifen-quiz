@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>拾分 · 导入器自测</title>
+<style>
+  :root { color-scheme: light; }
+  body { margin: 0; padding: 28px 32px 48px; font-family: "Microsoft YaHei", "PingFang SC", sans-serif; background: #f6f8f7; color: #22302a; }
+  h1 { margin: 0 0 6px; font-size: 22px; color: #17453a; }
+  p.lead { margin: 0 0 18px; color: #5b6b63; font-size: 13px; }
+  #summary { display: inline-block; margin-bottom: 16px; padding: 8px 16px; border-radius: 8px; font-weight: 700; background: #e8efeb; color: #1f6f5c; }
+  #summary.fail { background: #fdecea; color: #b23b2e; }
+  ol#log { margin: 0; padding-left: 22px; }
+  ol#log li { margin: 6px 0; font-size: 13px; line-height: 1.6; }
+  ol#log li.pass::marker { color: #1f8a63; font-weight: 700; }
+  ol#log li.fail { color: #b23b2e; }
+  ol#log li .detail { color: #6b7a72; font-size: 12px; }
+  pre#result { margin-top: 22px; padding: 12px; background: #10231d; color: #b9e6d4; font-size: 11px; white-space: pre-wrap; word-break: break-all; border-radius: 8px; }
+</style>
+</head>
+<body>
+<h1>拾分 · 导入器自测</h1>
+<p class="lead">使用真实 File 对象调用 window.ShifenImport.parseFile / parseFiles / parseText。可直接用 Chrome headless 运行，也可本地静态服务器打开。</p>
+<div id="summary">运行中…</div>
+<ol id="log"></ol>
+<pre id="result">PENDING</pre>
+<script src="../js/importers.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  var state = { results: [], finished: false };
+
+  function summaryElement() { return document.getElementById("summary"); }
+  function logElement() { return document.getElementById("log"); }
+  function resultElement() { return document.getElementById("result"); }
+
+  function describe(error) {
+    if (!error) return "未知错误";
+    return String(error && error.message ? error.message : error);
+  }
+
+  function expect(condition, message) {
+    if (!condition) throw new Error(message);
+  }
+
+  function renderRow(name, passed, detail) {
+    var item = document.createElement("li");
+    item.className = passed ? "pass" : "fail";
+    item.textContent = (passed ? "通过 · " : "失败 · ") + name;
+    if (detail) {
+      var span = document.createElement("span");
+      span.className = "detail";
+      span.textContent = " —— " + detail;
+      item.appendChild(span);
+    }
+    logElement().appendChild(item);
+  }
+
+  function finish() {
+    if (state.finished) return;
+    state.finished = true;
+    var failed = 0;
+    for (var i = 0; i < state.results.length; i++) {
+      if (!state.results[i].passed) failed++;
+    }
+    var total = state.results.length;
+    var passed = total - failed;
+    var allPassed = total > 0 && failed === 0;
+    var box = summaryElement();
+    box.textContent = "结果：" + passed + " / " + total + " 通过" + (allPassed ? " · ALL PASS" : " · 有失败项");
+    box.className = allPassed ? "" : "fail";
+    document.title = allPassed ? "PASS" : "FAIL";
+    var payload = {
+      passed: allPassed,
+      total: total,
+      passedCount: passed,
+      failedCount: failed,
+      results: state.results
+    };
+    resultElement().textContent = "__RESULT_JSON__" + JSON.stringify(payload) + "__RESULT_END__";
+  }
+
+  async function test(name, fn) {
+    try {
+      var detail = await fn();
+      state.results.push({ name: name, passed: true, detail: detail || "" });
+      renderRow(name, true, detail);
+    } catch (error) {
+      var message = describe(error);
+      state.results.push({ name: name, passed: false, detail: message });
+      renderRow(name, false, message);
+    }
+  }
+
+  function loadArrayBuffer(path) {
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open("GET", path, true);
+      xhr.responseType = "arraybuffer";
+      xhr.onload = function () {
+        if (xhr.status === 200 || xhr.status === 0) resolve(xhr.response);
+        else reject(new Error("读取失败（HTTP " + xhr.status + "）：" + path));
+      };
+      xhr.onerror = function () { reject(new Error("无法读取文件：" + path)); };
+      xhr.send();
+    });
+  }
+
+  async function loadSample(path, name) {
+    var buffer = await loadArrayBuffer(path);
+    return new File([buffer], name);
+  }
+
+  function base64ToBytes(base64) {
+    var binary = atob(base64);
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  /* ---------- 内存 ZIP 构造（仅 STORE，用于覆盖 method 0 与测试表头） ---------- */
+  var crcTable = null;
+
+  function crc32(bytes) {
+    if (!crcTable) {
+      crcTable = new Uint32Array(256);
+      for (var n = 0; n < 256; n++) {
+        var c = n;
+        for (var k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+        crcTable[n] = c >>> 0;
+      }
+    }
+    var crc = 0xffffffff;
+    for (var i = 0; i < bytes.length; i++) crc = crcTable[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+
+  function buildStoreZip(entries) {
+    var encoder = new TextEncoder();
+    var parts = [];
+    var centralParts = [];
+    var offset = 0;
+    for (var e = 0; e < entries.length; e++) {
+      var entry = entries[e];
+      var nameBytes = encoder.encode(entry.name);
+      var data = typeof entry.data === "string" ? encoder.encode(entry.data) : entry.data;
+      var checksum = crc32(data);
+      var useDescriptor = !!entry.dataDescriptor;
+      var flag = useDescriptor ? 0x0008 : 0;
+      var descriptorLength = useDescriptor ? 16 : 0;
+      var local = new Uint8Array(30 + nameBytes.length);
+      var localView = new DataView(local.buffer);
+      localView.setUint32(0, 0x04034b50, true);
+      localView.setUint16(4, 20, true);
+      localView.setUint16(6, flag, true);
+      localView.setUint16(8, 0, true);
+      localView.setUint16(10, 0, true);
+      localView.setUint16(12, 0x21, true);
+      localView.setUint32(14, useDescriptor ? 0 : checksum, true);
+      localView.setUint32(18, useDescriptor ? 0 : data.length, true);
+      localView.setUint32(22, useDescriptor ? 0 : data.length, true);
+      localView.setUint16(26, nameBytes.length, true);
+      localView.setUint16(28, 0, true);
+      local.set(nameBytes, 30);
+      parts.push(local, data);
+      if (useDescriptor) {
+        var descriptor = new Uint8Array(16);
+        var descriptorView = new DataView(descriptor.buffer);
+        descriptorView.setUint32(0, 0x08074b50, true);
+        descriptorView.setUint32(4, checksum, true);
+        descriptorView.setUint32(8, data.length, true);
+        descriptorView.setUint32(12, data.length, true);
+        parts.push(descriptor);
+      }
+
+      var central = new Uint8Array(46 + nameBytes.length);
+      var centralView = new DataView(central.buffer);
+      centralView.setUint32(0, 0x02014b50, true);
+      centralView.setUint16(4, 20, true);
+      centralView.setUint16(6, 20, true);
+      centralView.setUint16(8, flag, true);
+      centralView.setUint16(10, 0, true);
+      centralView.setUint16(12, 0, true);
+      centralView.setUint16(14, 0x21, true);
+      centralView.setUint32(16, checksum, true);
+      centralView.setUint32(20, data.length, true);
+      centralView.setUint32(24, data.length, true);
+      centralView.setUint16(28, nameBytes.length, true);
+      centralView.setUint16(30, 0, true);
+      centralView.setUint16(32, 0, true);
+      centralView.setUint16(34, 0, true);
+      centralView.setUint16(36, 0, true);
+      centralView.setUint32(38, 0, true);
+      centralView.setUint32(42, offset, true);
+      central.set(nameBytes, 46);
+      centralParts.push(central);
+
+      offset += 30 + nameBytes.length + data.length + descriptorLength;
+    }
+
+    var centralSize = 0;
+    for (var c = 0; c < centralParts.length; c++) centralSize += centralParts[c].length;
+    var eocd = new Uint8Array(22);
+    var eocdView = new DataView(eocd.buffer);
+    eocdView.setUint32(0, 0x06054b50, true);
+    eocdView.setUint16(8, entries.length, true);
+    eocdView.setUint16(10, entries.length, true);
+    eocdView.setUint32(12, centralSize, true);
+    eocdView.setUint32(16, offset, true);
+
+    var all = parts.concat(centralParts, [eocd]);
+    var totalLength = 0;
+    for (var a = 0; a < all.length; a++) totalLength += all[a].length;
+    var output = new Uint8Array(totalLength);
+    var position = 0;
+    for (var p = 0; p < all.length; p++) {
+      output.set(all[p], position);
+      position += all[p].length;
+    }
+    return output;
+  }
+
+  function minimalXlsxBytes() {
+    var workbook = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
+      'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+      '<sheets><sheet name="测试表" sheetId="1" r:id="rId1"/></sheets></workbook>';
+    var rels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+      '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" ' +
+      'Target="worksheets/sheet1.xml"/></Relationships>';
+    var shared = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="8" uniqueCount="8">' +
+      '<si><t>题目</t></si><si><t>答案</t></si><si><t>关键词</t></si><si><t>解析</t></si>' +
+      '<si><t>难度</t></si><si><t>标签</t></si>' +
+      '<si><r><t>富文本</t></r><r><t>拼接题目</t></r></si><si><t>富文本答案</t></si></sst>';
+    var sheet = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' +
+      '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><v>2</v></c>' +
+      '<c r="D1" t="s"><v>3</v></c><c r="E1" t="s"><v>4</v></c><c r="F1" t="s"><v>5</v></c></row>' +
+      '<row r="2"><c r="A2" t="s"><v>6</v></c><c r="B2" t="s"><v>7</v></c>' +
+      '<c r="C2" t="inlineStr"><is><t>键一、键二</t></is></c><c r="D2" t="str"><v>富文本解析</v></c>' +
+      '<c r="E2"><v>2</v></c><c r="F2" t="inlineStr"><is><t>标签甲、标签乙</t></is></c></row>' +
+      '<row r="3"><c r="A3" t="inlineStr"><is><t>布尔值测试</t></is></c><c r="B3" t="b"><v>1</v></c></row>' +
+      '<row r="4"><c r="A4" t="inlineStr"><is><t>换行答案测试</t></is></c>' +
+      '<c r="B4" t="inlineStr"><is><t xml:space="preserve">第一行\n第二行</t></is></c></row>' +
+      '</sheetData></worksheet>';
+    return buildStoreZip([
+      { name: "xl/workbook.xml", data: workbook },
+      { name: "xl/_rels/workbook.xml.rels", data: rels },
+      { name: "xl/sharedStrings.xml", data: shared, dataDescriptor: true },
+      { name: "xl/worksheets/sheet1.xml", data: sheet }
+    ]);
+  }
+
+  function tableDocxBytes(includeHeader) {
+    var rows = "";
+    if (includeHeader) {
+      rows += "<w:tr>" +
+        "<w:tc><w:p><w:r><w:t>题目</w:t></w:r></w:p></w:tc>" +
+        "<w:tc><w:p><w:r><w:t>答案</w:t></w:r></w:p></w:tc>" +
+        "<w:tc><w:p><w:r><w:t>关键词</w:t></w:r></w:p></w:tc>" +
+        "<w:tc><w:p><w:r><w:t>解析</w:t></w:r></w:p></w:tc>" +
+        "<w:tc><w:p><w:r><w:t>标签</w:t></w:r></w:p></w:tc>" +
+        "<w:tc><w:p><w:r><w:t>难度</w:t></w:r></w:p></w:tc>" +
+        "</w:tr>";
+    }
+    rows += "<w:tr>" +
+      "<w:tc><w:p><w:r><w:t>表格题目一</w:t></w:r></w:p></w:tc>" +
+      "<w:tc><w:p><w:r><w:t>表格答案第一行</w:t></w:r></w:p><w:p><w:r><w:t>表格答案第二行</w:t></w:r></w:p></w:tc>" +
+      "<w:tc><w:p><w:r><w:t>键A、键B</w:t></w:r></w:p></w:tc>" +
+      "<w:tc><w:p><w:r><w:t>表格解析</w:t></w:r></w:p></w:tc>" +
+      "<w:tc><w:p><w:r><w:t>标签A</w:t></w:r></w:p></w:tc>" +
+      "<w:tc><w:p><w:r><w:t>难</w:t></w:r></w:p></w:tc>" +
+      "</w:tr>";
+    rows += "<w:tr>" +
+      "<w:tc><w:p><w:r><w:t>表格题目二</w:t></w:r></w:p></w:tc>" +
+      "<w:tc><w:p><w:r><w:t>表格答案二</w:t></w:r></w:p></w:tc>" +
+      "<w:tc><w:p><w:r><w:t>键C</w:t></w:r></w:p></w:tc>" +
+      "<w:tc><w:p><w:r><w:t></w:t></w:r></w:p></w:tc>" +
+      "<w:tc><w:p><w:r><w:t>标签B</w:t></w:r></w:p></w:tc>" +
+      "<w:tc><w:p><w:r><w:t>1</w:t></w:r></w:p></w:tc>" +
+      "</w:tr>";
+    var xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>' +
+      '<w:tbl>' + rows + '</w:tbl>' +
+      '<w:p><w:r><w:t>表格外文字不应被解析成题目。</w:t></w:r></w:p>' +
+      '</w:body></w:document>';
+    return buildStoreZip([{ name: "word/document.xml", data: xml }]);
+  }
+
+  function testSummary(result) {
+    return "题数 " + result.questions.length + "，warnings " + result.warnings.length + "，errors " + result.errors.length;
+  }
+
+  async function main() {
+    var S = window.ShifenImport;
+
+    await test("API 契约完整", function () {
+      expect(S && typeof S === "object", "window.ShifenImport 未暴露");
+      var expected = ["xlsx", "csv", "txt", "md", "markdown", "json", "docx"];
+      expect(JSON.stringify(S.SUPPORTED_EXTENSIONS) === JSON.stringify(expected), "SUPPORTED_EXTENSIONS 与契约不一致");
+      expect(typeof S.parseFiles === "function", "parseFiles 缺失");
+      expect(typeof S.parseFile === "function", "parseFile 缺失");
+      expect(typeof S.parseText === "function", "parseText 缺失");
+      expect(typeof S.extractText === "function", "extractText 缺失");
+      expect(typeof S.buildTemplateCSV === "function", "buildTemplateCSV 缺失");
+      return "6 个入口与扩展名列表符合契约";
+    });
+
+    await test("xlsx 示例题库（全部工作表 + 表头映射）", async function () {
+      var file = await loadSample("../samples/示例题库.xlsx", "示例题库.xlsx");
+      var result = await S.parseFile(file);
+      expect(result.ok === true, "ok 应为 true：" + result.errors.join("；"));
+      expect(result.errors.length === 0, "不应有 errors：" + result.errors.join("；"));
+      expect(result.questions.length >= 12, "题数少于 12，实际 " + result.questions.length);
+      expect(result.meta.type === "xlsx", "meta.type 应为 xlsx");
+      expect(result.meta.sheets.indexOf("简答题") >= 0, "meta.sheets 缺少简答题");
+      expect(result.meta.sheets.indexOf("使用说明") >= 0, "meta.sheets 缺少使用说明");
+      var first = result.questions[0];
+      expect(first.question.indexOf("间隔重复") >= 0, "首题内容异常：" + first.question);
+      expect(first.answer.length >= 20, "答案过短");
+      expect(first.keywords.length >= 2, "关键词未解析");
+      expect(first.tags.length >= 1, "标签未解析");
+      expect([1, 2, 3].indexOf(first.difficulty) >= 0, "难度不是 1/2/3");
+      expect(/^示例题库\.xlsx \/ 简答题 \/ 第 \d+ 行$/.test(first.source), "source 格式异常：" + first.source);
+      expect(result.questions.every(function (q) { return q.question && q.answer && q.source && q.difficulty; }), "存在空字段题目");
+      return testSummary(result) + "，" + first.source;
+    });
+
+    await test("docx 示例文档（段落 + 多行答案）", async function () {
+      var file = await loadSample("../samples/简答题示例.docx", "简答题示例.docx");
+      var result = await S.parseFile(file);
+      expect(result.ok === true, "ok 应为 true：" + result.errors.join("；"));
+      expect(result.questions.length >= 6, "题数少于 6，实际 " + result.questions.length);
+      expect(result.meta.type === "docx", "meta.type 应为 docx");
+      var multiline = result.questions.filter(function (q) { return q.answer.indexOf("\n") >= 0; });
+      expect(multiline.length >= 1, "多行答案未保留换行");
+      expect(result.questions.every(function (q) { return q.keywords.length >= 1 && q.tags.length >= 1; }), "关键词或标签缺失");
+      expect(result.questions.every(function (q) { return q.question.indexOf("答案：") < 0; }), "题目混入了答案标签");
+      expect(/^简答题示例\.docx \/ 段落 \/ 第 \d+ 段$/.test(result.questions[0].source), "source 格式异常：" + result.questions[0].source);
+      return testSummary(result) + "，多行答案 " + multiline.length + " 题";
+    });
+
+    await test("csv 示例题库（BOM + 引号 + 表头）", async function () {
+      var file = await loadSample("../samples/示例题库.csv", "示例题库.csv");
+      var result = await S.parseFile(file);
+      expect(result.ok === true, "ok 应为 true：" + result.errors.join("；"));
+      expect(result.questions.length >= 12, "题数少于 12，实际 " + result.questions.length);
+      expect(result.meta.type === "csv", "meta.type 应为 csv");
+      expect(result.questions[0].question.charAt(0) !== "\uFEFF", "BOM 未清理");
+      expect(/^示例题库\.csv \/ 第 \d+ 行$/.test(result.questions[0].source), "source 格式异常：" + result.questions[0].source);
+      return testSummary(result);
+    });
+
+    await test("json 数组与 questions 包装", async function () {
+      var arrayFile = new File([JSON.stringify([
+        { question: "JSON 数组题目", answer: "JSON 数组答案", keywords: ["甲", "乙"], tags: ["标签"], difficulty: "中" }
+      ])], "数组.json");
+      var arrayResult = await S.parseFile(arrayFile);
+      expect(arrayResult.questions.length === 1, "数组格式题数应为 1");
+      expect(arrayResult.questions[0].keywords.length === 2, "数组关键词解析失败");
+      expect(arrayResult.questions[0].difficulty === 2, "难度归一化失败");
+
+      var wrappedFile = new File([JSON.stringify({
+        questions: [{ 题目: "包装题目", 答案: "包装答案", 难度: 3 }]
+      })], "包装.json");
+      var wrappedResult = await S.parseFile(wrappedFile);
+      expect(wrappedResult.questions.length === 1, "questions 包装题数应为 1");
+      expect(wrappedResult.questions[0].difficulty === 3, "包装难度解析失败");
+      return "数组 1 题，包装 1 题";
+    });
+
+    await test("txt 文本解析（题号 + 标签 + 空行兜底）", async function () {
+      var marked = "说明：以下为测试。\n\n1. 文本题目一\n答案：文本答案一\n关键词：甲、乙\n难度：易\n\n2. 文本题目二\n参考答案：文本答案二\n";
+      var markedFile = new File([marked], "标记.txt");
+      var markedResult = await S.parseFile(markedFile);
+      expect(markedResult.questions.length === 2, "标记文本应有 2 题，实际 " + markedResult.questions.length);
+      expect(markedResult.questions[0].answer === "文本答案一", "答案解析异常");
+      expect(markedResult.questions[0].difficulty === 1, "难度 易 归一化失败");
+
+      var blocks = "题目甲\n答案甲第一行\n答案甲第二行\n\n题目乙\n答案乙";
+      var blockFile = new File([blocks], "空行.txt");
+      var blockResult = await S.parseFile(blockFile);
+      expect(blockResult.questions.length === 2, "空行兜底应有 2 题，实际 " + blockResult.questions.length);
+      expect(blockResult.questions[0].answer.indexOf("\n") >= 0, "空行兜底多行答案未保留");
+      return "标记 2 题，空行 2 题";
+    });
+
+    await test("md 文件（去掉 Markdown 标记）", async function () {
+      var md = "# 1. Markdown 题目\n**答案：** Markdown 答案\n关键词：md、测试\n";
+      var file = new File([md], "笔记.md");
+      var result = await S.parseFile(file);
+      expect(result.questions.length === 1, "md 应有 1 题，实际 " + result.questions.length);
+      expect(result.questions[0].question === "Markdown 题目", "标题未正确解析：" + result.questions[0].question);
+      expect(result.questions[0].keywords.length === 2, "关键词解析失败");
+      return "1 题，关键词 " + result.questions[0].keywords.length + " 个";
+    });
+
+    await test("parseText CSV（引号、字段内换行、分隔符识别）", function () {
+      var csvText = '题目,答案,关键词\n"含,逗号的题目","第一行\n第二行","a、b"\n';
+      var result = S.parseText(csvText, { filename: "粘贴.csv", format: "csv" });
+      expect(result.questions.length === 1, "CSV 题数应为 1");
+      expect(result.questions[0].question === "含,逗号的题目", "引号内逗号解析失败");
+      expect(result.questions[0].answer.indexOf("\n") >= 0, "字段内换行丢失");
+      expect(result.questions[0].keywords.length === 2, "关键词解析失败");
+
+      var tabText = "题目\t答案\n制表符题目\t制表符答案\n";
+      var tabResult = S.parseText(tabText, { filename: "粘贴.txt", format: "csv" });
+      expect(tabResult.questions.length === 1, "制表符分隔识别失败");
+      return "逗号 1 题，制表符 1 题";
+    });
+
+    await test("gb18030 编码回退", async function () {
+      var bytes = base64ToBytes("zOLEvyy08LC4Csqyw7TKx0dCS7Hgwuss1eLKx9PDR0JLseDC67GjtOa1xLTwsLgK");
+      var file = new File([bytes], "gbk.csv");
+      var result = await S.parseFile(file);
+      expect(result.questions.length === 1, "GBK 文件应有 1 题，实际 " + result.questions.length);
+      expect(result.questions[0].question === "什么是GBK编码", "GBK 题目解码失败：" + result.questions[0].question);
+      expect(result.questions[0].answer.indexOf("GBK") >= 0, "GBK 答案解码失败");
+      return "UTF-8 失败后回退 gb18030 成功";
+    });
+
+    await test("buildTemplateCSV（BOM + 可回读）", function () {
+      var template = S.buildTemplateCSV();
+      expect(template.charCodeAt(0) === 0xfeff, "模板缺少 BOM");
+      expect(template.indexOf("题目") >= 0, "模板缺少表头");
+      var parsed = S.parseText(template, { filename: "模板.csv", format: "csv" });
+      expect(parsed.questions.length === 2, "模板示例应有 2 题，实际 " + parsed.questions.length);
+      return "BOM 正常，回读 2 题";
+    });
+
+    await test("ZIP STORE + sharedStrings/inlineStr/str/数字/布尔/换行/data descriptor", async function () {
+      var file = new File([minimalXlsxBytes()], "内置测试.xlsx");
+      var result = await S.parseFile(file);
+      expect(result.ok === true, "ok 应为 true：" + result.errors.join("；"));
+      expect(result.questions.length === 3, "应有 3 题，实际 " + result.questions.length);
+      var rich = result.questions[0];
+      expect(rich.question === "富文本拼接题目", "富文本 sharedStrings 拼接失败：" + rich.question);
+      expect(rich.answer === "富文本答案", "sharedStrings 答案失败");
+      expect(rich.keywords.length === 2, "inlineStr 关键词失败");
+      expect(rich.explanation === "富文本解析", "str 解析失败");
+      expect(rich.difficulty === 2, "数字难度失败");
+      expect(rich.tags.length === 2, "inlineStr 标签失败");
+      expect(result.questions[1].answer === "TRUE", "布尔单元格失败：" + result.questions[1].answer);
+      expect(result.questions[2].answer.indexOf("\n") >= 0, "单元格内换行丢失");
+      expect(result.questions[2].source.indexOf("第 4 行") >= 0, "行号错误：" + result.questions[2].source);
+      return "3 题，STORE 与 data descriptor 均通过";
+    });
+
+    await test("docx 表格（表头映射 + 单元格多行 + 表格优先）", async function () {
+      var file = new File([tableDocxBytes(true)], "表格.docx");
+      var result = await S.parseFile(file);
+      expect(result.questions.length === 2, "表格应有 2 题，实际 " + result.questions.length);
+      expect(result.questions[0].question === "表格题目一", "表格表头映射失败");
+      expect(result.questions[0].answer.indexOf("\n") >= 0, "单元格多行答案丢失");
+      expect(result.questions[0].difficulty === 3, "难度 难 归一化失败");
+      expect(result.questions[0].keywords.length === 2, "表格关键词解析失败");
+      expect(result.questions[0].source.indexOf("表格1") >= 0, "表格 source 异常");
+      expect(result.questions.every(function (q) { return q.question.indexOf("表格外") < 0; }), "表格优先原则失效");
+      return "2 题，表格优先";
+    });
+
+    await test("docx 无表头表格按列序兜底", async function () {
+      var file = new File([tableDocxBytes(false)], "无表头.docx");
+      var result = await S.parseFile(file);
+      expect(result.questions.length === 2, "无表头表格应有 2 题，实际 " + result.questions.length);
+      expect(result.questions[0].question === "表格题目一", "无表头列序兜底失败");
+      expect(result.warnings.some(function (w) { return w.indexOf("未识别到表头") >= 0; }), "缺少无表头提示");
+      return "2 题，按列序读取";
+    });
+
+    await test(".xls / 不支持格式 / 损坏 ZIP 均不 throw", async function () {
+      var xls = new File([new Uint8Array([1, 2, 3])], "旧版.xls");
+      var xlsResult = await S.parseFile(xls);
+      expect(xlsResult.ok === false, ".xls 应失败");
+      expect(xlsResult.errors[0].indexOf("另存为") >= 0, ".xls 错误提示不可读：" + xlsResult.errors[0]);
+
+      var pdf = new File([new Uint8Array([1])], "文档.pdf");
+      var pdfResult = await S.parseFile(pdf);
+      expect(pdfResult.ok === false, "不支持格式应失败");
+      expect(pdfResult.errors.length === 1, "不支持格式应有一条错误");
+
+      var broken = new File([new TextEncoder().encode("this is not a zip file")], "损坏.xlsx");
+      var brokenResult = await S.parseFile(broken);
+      expect(brokenResult.ok === false, "损坏 ZIP 应失败");
+      expect(brokenResult.errors[0].indexOf("ZIP") >= 0, "损坏 ZIP 错误提示异常");
+
+      var fake = { name: "x.csv" };
+      var fakeResult = await S.parseFile(fake);
+      expect(fakeResult.ok === false && fakeResult.errors.length >= 1, "无效文件对象应有错误");
+      return "4 种异常输入均返回 errors，未抛异常";
+    });
+
+    await test("parseFiles 聚合与错误汇总", async function () {
+      var good = new File(["1. 聚合题目\n答案：聚合答案\n"], "聚合.txt");
+      var bad = new File([new Uint8Array([1])], "坏.xls");
+      var aggregate = await S.parseFiles([good, bad]);
+      expect(aggregate.files.length === 2, "files 数量应为 2");
+      expect(aggregate.questions.length === 1, "聚合题数应为 1");
+      expect(aggregate.warnings.length >= 1, "聚合警告应包含错误信息");
+
+      var empty = await S.parseFiles(null);
+      expect(empty.files.length === 0 && empty.warnings.length === 1, "空输入应给出提示");
+      return "2 个文件聚合，1 题，1 条错误汇总";
+    });
+
+    await test("空题/空答案跳过并给 warning", function () {
+      var text = "题目,答案\n正常题目,正常答案\n有题无答,\n,只有答案\n";
+      var result = S.parseText(text, { filename: "缺字段.csv", format: "csv" });
+      expect(result.questions.length === 1, "应只保留 1 道完整题，实际 " + result.questions.length);
+      expect(result.warnings.some(function (w) { return w.indexOf("缺少答案") >= 0; }), "缺少答案 warning 缺失");
+      expect(result.warnings.some(function (w) { return w.indexOf("缺少题目") >= 0; }), "缺少题目 warning 缺失");
+      return "跳过 2 行，warnings " + result.warnings.length + " 条";
+    });
+
+    await test("空内容与坏 JSON 可读报错", function () {
+      var empty = S.parseText("   ", { filename: "空.txt", format: "text" });
+      expect(empty.ok === true && empty.warnings.length >= 1, "空文本应返回 warning");
+      var bad = S.parseText("{bad", { filename: "坏.json", format: "json" });
+      expect(bad.ok === false && bad.errors.length === 1, "坏 JSON 应返回错误");
+      expect(bad.errors[0].indexOf("JSON 解析失败") >= 0, "JSON 错误信息不可读");
+      return "空文本 warning，坏 JSON 中文错误";
+    });
+
+    await test("extractText xlsx（跳过说明页 + 制表符与换行）", async function () {
+      var file = await loadSample("../samples/示例题库.xlsx", "示例题库.xlsx");
+      var result = await S.extractText(file);
+      expect(result.ok === true, "ok 应为 true：" + result.warnings.join("；"));
+      expect(result.meta.type === "xlsx", "meta.type 应为 xlsx");
+      expect(result.meta.sheets.indexOf("简答题") >= 0, "缺少简答题工作表");
+      expect(result.meta.sheets.indexOf("使用说明") < 0, "说明页不应被提取");
+      expect(result.text.indexOf("间隔重复") >= 0, "缺少题目内容");
+      expect(result.text.indexOf("\t") >= 0, "缺少制表符列分隔");
+      expect(result.text.indexOf("\n") >= 0, "缺少换行行分隔");
+      expect(result.text.indexOf("拾分 · 简答题题库导入示例") < 0, "说明页内容混入");
+      expect(result.meta.chars === result.text.length, "chars 与 text 长度不一致");
+      return "chars " + result.meta.chars + "，sheets " + result.meta.sheets.join("、");
+    });
+
+    await test("extractText ZIP STORE（富文本/布尔/单元格换行）", async function () {
+      var file = new File([minimalXlsxBytes()], "内置文本.xlsx");
+      var result = await S.extractText(file);
+      expect(result.ok === true, "ok 应为 true：" + result.warnings.join("；"));
+      expect(result.text.indexOf("富文本拼接题目\t富文本答案") >= 0, "富文本行拼接异常");
+      expect(result.text.indexOf("布尔值测试\tTRUE") >= 0, "布尔单元格异常");
+      expect(result.text.indexOf("换行答案测试\t第一行 第二行") >= 0, "单元格内换行未压成空格");
+      expect(result.meta.sheets.indexOf("测试表") >= 0, "sheets 缺少测试表");
+      return "chars " + result.meta.chars;
+    });
+
+    await test("extractText docx（段落与表格按文档顺序）", async function () {
+      var sampleFile = await loadSample("../samples/简答题示例.docx", "简答题示例.docx");
+      var sampleResult = await S.extractText(sampleFile);
+      expect(sampleResult.ok === true, "ok 应为 true：" + sampleResult.warnings.join("；"));
+      expect(sampleResult.meta.type === "docx", "meta.type 应为 docx");
+      expect(sampleResult.text.indexOf("1. 什么是间隔重复") >= 0, "段落内容缺失");
+      expect(sampleResult.text.indexOf("答案：") >= 0, "答案标签缺失");
+      expect(sampleResult.text.indexOf("补充：") >= 0, "后续段落缺失");
+
+      var tableFile = new File([tableDocxBytes(true)], "表格文本.docx");
+      var tableResult = await S.extractText(tableFile);
+      expect(tableResult.text.indexOf("题目 | 答案 | 关键词") >= 0, "表格行未用 | 连接");
+      expect(tableResult.text.indexOf("表格题目一 | 表格答案第一行 表格答案第二行") >= 0, "表格单元格多行未合并");
+      var paragraphIndex = tableResult.text.indexOf("表格外文字不应被解析成题目。");
+      var tableIndex = tableResult.text.indexOf("表格题目一");
+      expect(tableIndex >= 0 && paragraphIndex > tableIndex, "段落与表格未按文档顺序输出");
+      return "chars " + sampleResult.meta.chars + " / " + tableResult.meta.chars;
+    });
+
+    await test("extractText 文本 / Markdown / CSV / JSON / gb18030", async function () {
+      var txtResult = await S.extractText(new File(["第一行\r\n第二行"], "笔记.txt"));
+      expect(txtResult.ok === true && txtResult.text === "第一行\n第二行", "txt 解码或换行归一化失败");
+      expect(txtResult.meta.type === "txt", "txt meta.type 异常");
+
+      var mdResult = await S.extractText(new File(["# 标题\n**内容**"], "笔记.md"));
+      expect(mdResult.text.indexOf("# 标题") >= 0, "Markdown 应按原文保留");
+      expect(mdResult.meta.type === "md", "md meta.type 异常");
+
+      var csvResult = await S.extractText(new File(["\uFEFF题目,答案\n甲,乙"], "表.csv"));
+      expect(csvResult.text === "题目,答案\n甲,乙", "CSV BOM 未清理");
+      expect(csvResult.meta.type === "csv", "csv meta.type 异常");
+
+      var jsonResult = await S.extractText(new File([JSON.stringify({ 题目: "甲", 答案: "乙" })], "题.json"));
+      expect(jsonResult.text.indexOf("\n  ") >= 0, "JSON 未美化");
+      expect(jsonResult.text.indexOf("\"题目\"") >= 0, "JSON 内容缺失");
+      expect(jsonResult.meta.type === "json", "json meta.type 异常");
+
+      var gbkBytes = base64ToBytes("zOLEvyy08LC4Csqyw7TKx0dCS7Hgwuss1eLKx9PDR0JLseDC67GjtOa1xLTwsLgK");
+      var gbkResult = await S.extractText(new File([gbkBytes], "gbk.txt"));
+      expect(gbkResult.text.indexOf("什么是GBK编码") >= 0, "gb18030 回退失败");
+      return "txt/md/csv/json/gbk 均通过";
+    });
+
+    await test("extractText 错误提示与 200k 截断", async function () {
+      var pdfResult = await S.extractText(new File([new Uint8Array([1])], "材料.pdf"));
+      expect(pdfResult.ok === false && pdfResult.warnings[0].indexOf("PDF") >= 0, "PDF 提示异常");
+      var docResult = await S.extractText(new File([new Uint8Array([1])], "材料.doc"));
+      expect(docResult.ok === false && docResult.warnings[0].indexOf(".docx") >= 0, ".doc 提示异常");
+      var xlsResult = await S.extractText(new File([new Uint8Array([1])], "材料.xls"));
+      expect(xlsResult.ok === false && xlsResult.warnings[0].indexOf(".xlsx") >= 0, ".xls 提示异常");
+      var otherResult = await S.extractText(new File([new Uint8Array([1])], "材料.pptx"));
+      expect(otherResult.ok === false && otherResult.warnings[0].indexOf("不支持") >= 0, "不支持格式提示异常");
+      var fakeResult = await S.extractText({ name: "无头.txt" });
+      expect(fakeResult.ok === false && fakeResult.warnings.length >= 1, "无效文件对象未报错");
+
+      var bigText = "测".repeat(200050);
+      var bigResult = await S.extractText(new File([bigText], "大文件.txt"));
+      expect(bigResult.ok === true, "大文件应可提取");
+      expect(bigResult.text.length === 200000, "截断长度应为 200000，实际 " + bigResult.text.length);
+      expect(bigResult.meta.chars === 200000, "chars 应为 200000");
+      expect(bigResult.warnings.some(function (w) { return w.indexOf("截断") >= 0; }), "缺少截断说明");
+      return "错误提示 5 类，截断 200000 字符";
+    });
+
+    finish();
+  }
+
+  window.addEventListener("error", function (event) {
+    if (state.finished) return;
+    var message = event && event.message ? event.message : "脚本错误";
+    state.results.push({ name: "脚本运行错误", passed: false, detail: String(message) });
+    finish();
+  });
+
+  window.addEventListener("unhandledrejection", function (event) {
+    if (state.finished) return;
+    var reason = event && event.reason ? describe(event.reason) : "未处理的 Promise 错误";
+    state.results.push({ name: "未处理的 Promise 错误", passed: false, detail: reason });
+    finish();
+  });
+
+  main().catch(function (error) {
+    if (state.finished) return;
+    state.results.push({ name: "测试主流程异常", passed: false, detail: describe(error) });
+    finish();
+  });
+})();
+</script>
+</body>
+</html>
